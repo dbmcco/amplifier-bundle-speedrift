@@ -6,8 +6,13 @@ This repo is the integration layer that makes Amplifier operate in strict, Workg
 
 ## Acknowledgements
 
-Speedrift builds on [Workgraph](https://graphwork.github.io/), an independent project led by [Erik Garrison](https://github.com/ekg) and contributors.
+Speedrift builds on [Workgraph](https://graphwork.github.io/) and the broader contributor ecosystem around graph-native coordination.
 This bundle is separate and uses Workgraph as its execution spine.
+
+This integration is also informed by:
+
+- [Amplifier](https://github.com/microsoft/amplifier)
+- Sam Ramparte's reference bundle patterns, including [amplifier-bundle-beads-superpowers](https://github.com/ramparte/amplifier-bundle-beads-superpowers)
 
 ## Status
 
@@ -30,9 +35,7 @@ That means:
 
 ## Why This Exists
 
-Amplifier is a strong runtime/cockpit, but it does not by itself enforce a Speedrift operating contract.
-
-This bundle adds that contract:
+This bundle operationalizes Speedrift goals inside Amplifier so teams can start quickly and stay aligned:
 
 - **state discipline**: Workgraph-only task lifecycle
 - **drift discipline**: pre/post task checks with `./.workgraph/drifts check`
@@ -269,6 +272,8 @@ Separation is intentional:
 - Orchestrator: https://github.com/dbmcco/driftdriver
 - Baseline lane: https://github.com/dbmcco/coredrift
 - Brownfield lane: https://github.com/dbmcco/redrift
+- Amplifier: https://github.com/microsoft/amplifier
+- Sam Ramparte reference: https://github.com/ramparte/amplifier-bundle-beads-superpowers
 
 ## License
 
