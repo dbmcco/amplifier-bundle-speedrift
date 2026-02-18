@@ -1,0 +1,12 @@
+behavior:
+  name: speedrift
+  version: 0.1.0
+  description: Workgraph-first Speedrift orchestration behavior with enforced pre/post drift checks.
+
+agents:
+  speedrift-coordinator:
+    bundle: speedrift:agents/speedrift-coordinator.md
+
+context:
+  include:
+    - speedrift:context/speedrift-protocol.md

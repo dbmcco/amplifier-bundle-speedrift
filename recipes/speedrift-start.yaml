@@ -1,0 +1,44 @@
+name: speedrift-start
+description: Idempotent start/resume bootstrap for Workgraph-first Speedrift execution.
+version: "0.1.0"
+author: Speedrift
+
+tags: ["speedrift", "workgraph", "bootstrap", "no-beads"]
+
+context:
+  ensure_workgraph: true
+
+stages:
+  - name: bootstrap
+    steps:
+      - id: ensure-workgraph
+        bash: |
+          set -euo pipefail
+          if [ "{{ensure_workgraph}}" = "true" ] && [ ! -d ".workgraph" ]; then
+            wg init
+          fi
+          echo '{"ok": true}'
+        parse_json: true
+        output: workgraph_status
+
+      - id: install-speedrift
+        bash: |
+          set -euo pipefail
+          driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift
+          ./.workgraph/coredrift ensure-contracts --apply
+          echo '{"ok": true}'
+        parse_json: true
+        output: install_status
+
+      - id: summary
+        agent: foundation:zen-architect
+        mode: ANALYZE
+        prompt: |
+          Summarize bootstrap outcome briefly.
+
+          workgraph_status={{workgraph_status}}
+          install_status={{install_status}}
+
+          Include next command to begin work:
+          `wg ready`
+        output: summary

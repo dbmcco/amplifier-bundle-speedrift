@@ -1,0 +1,60 @@
+name: speedrift-redrift
+description: Launch redrift phased execution lane for brownfield v2 rebuild.
+version: "0.1.0"
+author: Speedrift
+
+tags: ["speedrift", "redrift", "brownfield", "v2"]
+
+context:
+  root_task_id: ""
+  v2_repo: ""
+  phase_checks: true
+
+stages:
+  - name: execute-redrift
+    steps:
+      - id: validate-input
+        bash: |
+          set -euo pipefail
+          if [ -z "{{root_task_id}}" ]; then
+            echo '{"ok":false,"error":"root_task_id is required"}'
+            exit 0
+          fi
+          echo '{"ok":true}'
+        parse_json: true
+        output: validation
+
+      - id: run-redrift
+        bash: |
+          set -euo pipefail
+          if [ "{{validation.ok}}" != "true" ]; then
+            echo '{"ran":false}'
+            exit 0
+          fi
+
+          CMD=(./.workgraph/redrift wg execute --task "{{root_task_id}}" --write-log)
+          if [ -n "{{v2_repo}}" ]; then
+            CMD+=(--v2-repo "{{v2_repo}}")
+          fi
+          if [ "{{phase_checks}}" = "true" ]; then
+            CMD+=(--phase-checks)
+          fi
+
+          "${CMD[@]}" || true
+          echo '{"ran":true}'
+        parse_json: true
+        output: execution
+
+      - id: summary
+        agent: foundation:zen-architect
+        mode: ANALYZE
+        prompt: |
+          Summarize redrift lane launch for root task {{root_task_id}}.
+
+          validation={{validation}}
+          execution={{execution}}
+
+          Include next operations:
+          - check generated phase tasks
+          - run per-phase verify/check/commit sequence
+        output: summary

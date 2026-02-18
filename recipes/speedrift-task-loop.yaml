@@ -1,0 +1,106 @@
+name: speedrift-task-loop
+description: Execute ready Workgraph tasks with enforced pre/post Speedrift checks.
+version: "0.1.0"
+author: Speedrift
+
+tags: ["speedrift", "task-loop", "workgraph", "no-beads"]
+
+context:
+  task_id: ""
+  lane_strategy: auto
+
+stages:
+  - name: select-task
+    steps:
+      - id: resolve-task-id
+        bash: |
+          set -euo pipefail
+          if [ -n "{{task_id}}" ]; then
+            printf '{"task_id":"%s"}\n' "{{task_id}}"
+            exit 0
+          fi
+          READY_ID=$(wg ready --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d[0]["id"] if d else ""))')
+          if [ -z "$READY_ID" ]; then
+            echo '{"task_id":""}'
+          else
+            printf '{"task_id":"%s"}\n' "$READY_ID"
+          fi
+        parse_json: true
+        output: resolved
+
+  - name: execute
+    steps:
+      - id: guard-no-task
+        bash: |
+          set -euo pipefail
+          if [ -z "{{resolved.task_id}}" ]; then
+            echo '{"status":"idle","message":"No ready tasks"}'
+          else
+            echo '{"status":"ok"}'
+          fi
+        parse_json: true
+        output: guard
+
+      - id: claim-task
+        bash: |
+          set -euo pipefail
+          if [ "{{guard.status}}" = "idle" ]; then
+            echo '{"claimed":false}'
+            exit 0
+          fi
+          wg claim "{{resolved.task_id}}"
+          echo '{"claimed":true}'
+        parse_json: true
+        output: claim
+
+      - id: precheck
+        bash: |
+          set -euo pipefail
+          if [ "{{claim.claimed}}" != "true" ]; then
+            echo '{"ran":false}'
+            exit 0
+          fi
+          ./.workgraph/drifts check --task "{{resolved.task_id}}" --lane-strategy "{{lane_strategy}}" --write-log --create-followups || true
+          echo '{"ran":true}'
+        parse_json: true
+        output: precheck
+
+      - id: implement
+        agent: foundation:modular-builder
+        prompt: |
+          Implement Workgraph task {{resolved.task_id}}.
+
+          Rules:
+          - Use Workgraph task context as source of truth.
+          - No Beads usage.
+          - Make changes needed for this task only.
+          - Run relevant tests for touched code.
+          - Return a short implementation summary.
+        output: implementation
+
+      - id: postcheck
+        bash: |
+          set -euo pipefail
+          if [ "{{claim.claimed}}" != "true" ]; then
+            echo '{"ran":false}'
+            exit 0
+          fi
+          ./.workgraph/drifts check --task "{{resolved.task_id}}" --lane-strategy "{{lane_strategy}}" --write-log --create-followups || true
+          echo '{"ran":true}'
+        parse_json: true
+        output: postcheck
+
+      - id: finalize
+        agent: foundation:zen-architect
+        mode: ANALYZE
+        prompt: |
+          Build a concise final note for task {{resolved.task_id}}.
+
+          implementation={{implementation}}
+          precheck={{precheck}}
+          postcheck={{postcheck}}
+
+          Include a recommended next command:
+          - `wg done {{resolved.task_id}}` if complete
+          - or create follow-up task(s) if not complete
+        output: summary
