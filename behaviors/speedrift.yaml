@@ -1,6 +1,6 @@
 behavior:
   name: speedrift
-  version: 0.1.0
+  version: 0.3.0
   description: Workgraph-first Speedrift orchestration behavior with enforced pre/post drift checks.
 
 agents:
@@ -10,3 +10,4 @@ agents:
 context:
   include:
     - speedrift:context/speedrift-protocol.md
+    - speedrift:context/model-routing.md

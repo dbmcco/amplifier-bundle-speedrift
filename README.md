@@ -53,6 +53,27 @@ When active, the bundle biases execution toward this flow:
 5. Run post-check drift telemetry
 6. Convert uncertainty into follow-up tasks instead of in-place drift
 
+## Autostart With Workgraph
+
+This bundle includes shell-hook support (`hook-shell`) and can run with repo-level autostart hooks.
+
+Recommended repo wiring (from your project root):
+
+```bash
+driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift --with-amplifier-executor
+```
+
+That writes:
+
+- `.workgraph/executors/amplifier.toml` + `.workgraph/executors/amplifier-run.sh`
+- `.amplifier/hooks/speedrift-autostart/hooks.json`
+- `.amplifier/hooks/speedrift-autostart/session-start.sh`
+
+Effect:
+
+- Workgraph can spawn Amplifier executor sessions
+- Amplifier autostart hooks auto-check Workgraph/Speedrift bootstrap state at session start and first prompt submit
+
 ## Mental Model
 
 - **Track**: Workgraph graph (`wg`) for tasks/dependencies/loops
@@ -69,6 +90,45 @@ This bundle follows the same Speedrift split:
 - **models decide**: Amplifier agents interpret evidence and choose next actions
 - **graph records intent**: contracts/fences/logs live in Workgraph artifacts
 - **follow-ups over hidden fixes**: uncertain work is externalized to tasks
+
+## Technical Escalation Policy
+
+Default posture is "research first, ask last":
+
+- resolve technical parameters from local evidence before asking (task context, repo config, running services)
+- if user intent is clear but one technical value is missing, infer and proceed
+- ask the user only for judgment-level choices (priority, aesthetics, policy/risk) or missing credentials
+- when a question is required, provide one concise question with a recommended default and evidence
+
+## Model Routing Profiles
+
+This bundle supports profile-driven model routing inside recipes:
+
+- `balanced`: default feature/fix workflow
+- `quality`: deeper reasoning (recommended for complex/redrift work)
+- `cost`: cheaper models for routine loops and summaries
+- `local`: prefer local models first, then cloud fallback
+
+Stage overrides are supported so different Speedrift parts can use different models:
+
+- `model_profile`: root/default profile
+- `implementation_profile`: implementation stage override (`speedrift-task-loop.yaml`)
+- `summary_profile`: summary/analysis stage override
+
+Default stage behavior:
+
+- implementation uses `model_profile` unless `implementation_profile` is set
+- summaries default to `cost` for most flows
+- summaries default to `balanced` when `model_profile=quality`
+- summaries default to `local` when `model_profile=local`
+
+Provider preferences include Anthropic, OpenAI, Ollama (local profile), and Google Gemini (`gemini-3.1-pro-preview-customtools*` preferred for tool-heavy loops, then `gemini-3.1-pro-preview*`, then `gemini-3-pro-preview*`).
+
+The profile does not change Speedrift policy:
+
+- Workgraph remains the source of truth
+- pre/post `./.workgraph/drifts check` still runs
+- findings still become `wg log` + follow-up tasks
 
 ## Architecture
 
@@ -131,35 +191,57 @@ If no Workgraph yet:
 wg init
 ```
 
-Run bundle bootstrap recipe:
+Install/refresh Speedrift wrappers and contracts:
 
 ```bash
-amplifier run "execute speedrift-start.yaml"
+./.workgraph/driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift --with-amplifier-executor \
+  || ./.workgraph/driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift
+./.workgraph/coredrift ensure-contracts --apply
 ```
 
-This performs:
+If `./.workgraph/driftdriver` is missing, use:
 
-- `driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift`
-- `./.workgraph/coredrift ensure-contracts --apply`
+```bash
+driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift --with-amplifier-executor \
+  || driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift
+./.workgraph/coredrift ensure-contracts --apply
+```
 
 ### 2) Run The Day-To-Day Task Loop
 
-One pass:
+Kickoff autopilot:
 
 ```bash
-amplifier run "execute speedrift-task-loop.yaml"
+amplifier "Let's get started. Use speedrift and workgraph. Do not ask for scope; claim the first ready task and execute."
 ```
 
-Explicit task:
+Explicit single-task pass:
 
 ```bash
-amplifier run "execute speedrift-task-loop.yaml with task_id='my-task-id'"
+amplifier "Claim task my-task-id, run pre/post ./.workgraph/drifts check, implement, and mark done/submit."
 ```
 
-Force full-suite lane strategy on hard tasks:
+Direct CLI loop (deterministic fallback):
 
 ```bash
-amplifier run "execute speedrift-task-loop.yaml with task_id='my-task-id' lane_strategy='all'"
+TASK_ID=$(wg ready --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d[0]["id"] if d else ""))')
+wg claim "$TASK_ID"
+./.workgraph/drifts check --task "$TASK_ID" --lane-strategy auto --write-log --create-followups
+# implement task work
+./.workgraph/drifts check --task "$TASK_ID" --lane-strategy auto --write-log --create-followups
+wg done "$TASK_ID"
+```
+
+Low-cost routine pass:
+
+```bash
+amplifier "Use cost profile behavior for task my-task-id. Run full pre/post drift loop and complete if clean."
+```
+
+Prefer local models:
+
+```bash
+amplifier "Use local profile behavior for task my-task-id. Run full pre/post drift loop and complete if clean."
 ```
 
 ### 3) Brownfield Rebuilds (v1 -> v2)
@@ -167,14 +249,16 @@ amplifier run "execute speedrift-task-loop.yaml with task_id='my-task-id' lane_s
 Launch phased redrift lane:
 
 ```bash
-amplifier run "execute speedrift-redrift.yaml with root_task_id='redrift-app-v2'"
+./.workgraph/redrift wg execute --task redrift-app-v2 --write-log --phase-checks
 ```
 
 With explicit v2 target path:
 
 ```bash
-amplifier run "execute speedrift-redrift.yaml with root_task_id='redrift-app-v2' v2_repo='/path/to/app-v2'"
+./.workgraph/redrift wg execute --task redrift-app-v2 --write-log --phase-checks
 ```
+
+Set the v2 path in the task's `redrift` block/fence before execution.
 
 Recommended per-phase closeout:
 
@@ -190,13 +274,70 @@ Recommended per-phase closeout:
 ./.workgraph/drifts orchestrate --write-log --create-followups
 ```
 
-## Recipe Reference
+### 4b) Zero-Friction Start Pattern
+
+With the global bundle set to `speedrift` and autostart hooks installed in the repo:
+
+```bash
+amplifier
+```
+
+Then a simple prompt like "get started and use speedrift with workgraph" should:
+
+1. bootstrap/resume wrappers and contracts
+2. execute task-loop passes until the queue idles
+3. externalize drift findings as logs/follow-ups
+
+### 5) Provider/Model Overrides At Runtime
+
+Use Amplifier provider switching for global/session-level defaults:
+
+```bash
+amplifier provider use anthropic --model claude-sonnet-*
+amplifier provider use openai --model gpt-5*
+amplifier provider use gemini --model gemini-3.1-pro-preview-customtools
+amplifier provider use ollama --model qwen2.5-coder
+```
+
+Use one-off run overrides when needed:
+
+```bash
+amplifier run --provider openai --model gpt-5.2 "Reply with current provider/model and confirm tool-use readiness."
+amplifier run --provider gemini --model gemini-3.1-pro-preview-customtools "Reply with current provider/model and confirm tool-use readiness."
+```
+
+Use stage-specific profile overrides when needed:
+
+```bash
+amplifier run "execute speedrift-task-loop.yaml with task_id='my-task-id' model_profile='quality' summary_profile='cost'"
+amplifier run "execute speedrift-task-loop.yaml with task_id='my-task-id' model_profile='balanced' implementation_profile='quality' summary_profile='cost'"
+```
+
+Task closure mode (`speedrift-task-loop.yaml`):
+
+- `completion_mode='suggest'` (default): recipe summarizes next command and leaves closure to operator.
+- `completion_mode='auto'`: recipe attempts deterministic closure (`wg done`, or `wg submit` when verification is required).
+
+If a session keeps "planning" instead of executing:
+
+```bash
+amplifier tool invoke recipes \
+  operation=execute \
+  recipe_path=/Users/braydon/projects/experiments/amplifier-bundle-speedrift/recipes/speedrift-task-loop.yaml \
+  context='{"model_profile":"balanced","summary_profile":"cost","completion_mode":"auto"}'
+```
+
+This bypasses conversational planning and runs one deterministic task-loop pass directly.
+
+## Recipe Assets
 
 | Recipe | Purpose | Typical Use |
 |---|---|---|
 | `speedrift-start.yaml` | idempotent install/resume bootstrap | start of session/project |
 | `speedrift-task-loop.yaml` | claim + precheck + implement + postcheck | normal feature/fix loop |
 | `speedrift-redrift.yaml` | launch redrift phased lane | brownfield v2 programs |
+
+Note: these files are maintained in this bundle repo; do not rely on `recipes execute` path lookup in arbitrary app repos unless you have explicitly mounted those recipe files into the runtime.
 
 ## Kickoff Prompts
 
@@ -223,7 +364,8 @@ Expected behavior:
 If recipe execution is unavailable, use direct Speedrift commands:
 
 ```bash
-driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift
+driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift --with-amplifier-executor \
+  || driftdriver install --wrapper-mode portable --with-uxdrift --with-therapydrift --with-yagnidrift --with-redrift
 ./.workgraph/coredrift ensure-contracts --apply
 ./.workgraph/drifts check --task <task_id> --write-log --create-followups
 ```
@@ -235,6 +377,7 @@ amplifier-bundle-speedrift/
   bundle.md
   behaviors/speedrift.yaml
   context/speedrift-protocol.md
+  context/model-routing.md
   agents/speedrift-coordinator.md
   recipes/
     speedrift-start.yaml
@@ -273,6 +416,8 @@ Separation is intentional:
 - Baseline lane: https://github.com/dbmcco/coredrift
 - Brownfield lane: https://github.com/dbmcco/redrift
 - Amplifier: https://github.com/microsoft/amplifier
+- Sam Ramparte tutorial: https://github.com/ramparte/amplifier-tutorial
+- Sam Ramparte Workgraph bundle: https://github.com/ramparte/amplifier-bundle-workgraph
 - Sam Ramparte reference: https://github.com/ramparte/amplifier-bundle-beads-superpowers
 
 ## License

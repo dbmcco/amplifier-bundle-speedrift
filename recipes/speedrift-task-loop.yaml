@@ -1,13 +1,17 @@
 name: speedrift-task-loop
 description: Execute ready Workgraph tasks with enforced pre/post Speedrift checks.
-version: "0.1.0"
+version: "0.3.0"
 author: Speedrift
 
-tags: ["speedrift", "task-loop", "workgraph", "no-beads"]
+tags: ["speedrift", "task-loop", "workgraph", "no-beads", "model-routing"]
 
 context:
   task_id: ""
   lane_strategy: auto
+  model_profile: balanced
+  implementation_profile: ""
+  summary_profile: ""
+  completion_mode: suggest
 
 stages:
   - name: select-task
@@ -27,6 +31,50 @@ stages:
           fi
         parse_json: true
         output: resolved
+
+      - id: resolve-model-profile
+        bash: |
+          set -euo pipefail
+          ROOT_PROFILE="{{model_profile}}"
+          IMPLEMENTATION_PROFILE="{{implementation_profile}}"
+          SUMMARY_PROFILE="{{summary_profile}}"
+          COMPLETION_MODE="{{completion_mode}}"
+
+          normalize_profile() {
+            case "$1" in
+              balanced|quality|cost|local) printf '%s' "$1" ;;
+              *) printf '' ;;
+            esac
+          }
+
+          ROOT_NORM="$(normalize_profile "$ROOT_PROFILE")"
+          if [ -z "$ROOT_NORM" ]; then
+            ROOT_NORM="balanced"
+          fi
+
+          IMPLEMENTATION_NORM="$(normalize_profile "$IMPLEMENTATION_PROFILE")"
+          if [ -z "$IMPLEMENTATION_NORM" ]; then
+            IMPLEMENTATION_NORM="$ROOT_NORM"
+          fi
+
+          SUMMARY_NORM="$(normalize_profile "$SUMMARY_PROFILE")"
+          if [ -z "$SUMMARY_NORM" ]; then
+            case "$ROOT_NORM" in
+              local) SUMMARY_NORM="local" ;;
+              quality) SUMMARY_NORM="balanced" ;;
+              *) SUMMARY_NORM="cost" ;;
+            esac
+          fi
+
+          case "$COMPLETION_MODE" in
+            auto|suggest) COMPLETION_NORM="$COMPLETION_MODE" ;;
+            *) COMPLETION_NORM="suggest" ;;
+          esac
+
+          printf '{"model_profile":"%s","implementation_profile":"%s","summary_profile":"%s","completion_mode":"%s"}\n' \
+            "$ROOT_NORM" "$IMPLEMENTATION_NORM" "$SUMMARY_NORM" "$COMPLETION_NORM"
+        parse_json: true
+        output: route
 
   - name: execute
     steps:
@@ -65,18 +113,291 @@ stages:
         parse_json: true
         output: precheck
 
-      - id: implement
+      - id: discover-runtime-context
+        bash: |
+          set -euo pipefail
+          if [ "{{claim.claimed}}" != "true" ]; then
+            echo '{"ran":false}'
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json
+          import re
+          import shutil
+          import subprocess
+
+          TASK_ID = "{{resolved.task_id}}"
+          EMBED_HINT = re.compile(
+              r"(nomic-embed-text|mxbai-embed-large|all-minilm[\w:.-]*|bge[\w:.-]*|e5[\w:.-]*|granite-embedding:[\w.-]+|text-embedding-[\w.-]+)",
+              re.IGNORECASE,
+          )
+          EMBED_KEYWORDS = ("embed", "embedding", "nomic", "mxbai", "granite", "bge", "e5", "all-minilm")
+
+          def run(cmd):
+              try:
+                  proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                  return (proc.stdout or "").strip()
+              except Exception:
+                  return ""
+
+          def parse_ollama_models(output):
+              lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+              if not lines:
+                  return []
+              rows = []
+              for ln in lines[1:]:
+                  rows.append(ln.split()[0])
+              return rows
+
+          def pick_embed(models):
+              for model in models:
+                  lowered = model.lower()
+                  if any(k in lowered for k in EMBED_KEYWORDS):
+                      return model
+              return ""
+
+          task_json_raw = run(["wg", "show", TASK_ID, "--json"]) if TASK_ID else ""
+          task_description = ""
+          if task_json_raw:
+              try:
+                  task_payload = json.loads(task_json_raw)
+                  task_description = (
+                      f"{task_payload.get('title', '')}\n{task_payload.get('description', '')}".strip()
+                  )
+              except Exception:
+                  task_description = ""
+
+          repo_hits = []
+          if shutil.which("rg"):
+              repo_scan = run(
+                  [
+                      "rg",
+                      "-n",
+                      "-S",
+                      "--no-heading",
+                      "--glob",
+                      "!**/.git/**",
+                      "--glob",
+                      "!**/node_modules/**",
+                      r"ollama|embedding|embed|EMBEDDING_MODEL|embedding_model|nomic-embed-text|mxbai-embed-large|granite-embedding|text-embedding",
+                      ".",
+                  ]
+              )
+              repo_hits = repo_scan.splitlines()[:20] if repo_scan else []
+
+          ollama_installed = bool(shutil.which("ollama"))
+          ollama_ps = run(["ollama", "ps"]) if ollama_installed else ""
+          ollama_list = run(["ollama", "list"]) if ollama_installed else ""
+
+          running_models = parse_ollama_models(ollama_ps)
+          installed_models = parse_ollama_models(ollama_list)
+
+          detected_model = ""
+          detection_source = ""
+
+          detected_model = pick_embed(running_models)
+          if detected_model:
+              detection_source = "ollama_ps"
+
+          if not detected_model and task_description:
+              match = EMBED_HINT.search(task_description)
+              if match:
+                  detected_model = match.group(1)
+                  detection_source = "task_context"
+
+          if not detected_model and repo_hits:
+              repo_blob = "\n".join(repo_hits)
+              match = EMBED_HINT.search(repo_blob)
+              if match:
+                  detected_model = match.group(1)
+                  detection_source = "repo_scan"
+
+          if not detected_model:
+              detected_model = pick_embed(installed_models)
+              if detected_model:
+                  detection_source = "ollama_list"
+
+          payload = {
+              "ran": True,
+              "task_id": TASK_ID,
+              "ollama_available": ollama_installed,
+              "detected_embedding_model": detected_model,
+              "detection_source": detection_source,
+              "running_ollama_models": running_models[:8],
+              "installed_ollama_models": installed_models[:12],
+              "repo_embedding_hints": repo_hits,
+              "question_policy": "research_first_escalate_for_judgment_only",
+          }
+          print(json.dumps(payload))
+          PY
+        parse_json: true
+        output: discovery
+
+      - id: implementation-gates
+        bash: |
+          set -euo pipefail
+          if [ "{{claim.claimed}}" != "true" ]; then
+            echo '{"run_balanced":"false","run_quality":"false","run_cost":"false","run_local":"false"}'
+            exit 0
+          fi
+          case "{{route.implementation_profile}}" in
+            balanced) echo '{"run_balanced":"true","run_quality":"false","run_cost":"false","run_local":"false"}' ;;
+            quality) echo '{"run_balanced":"false","run_quality":"true","run_cost":"false","run_local":"false"}' ;;
+            cost) echo '{"run_balanced":"false","run_quality":"false","run_cost":"true","run_local":"false"}' ;;
+            local) echo '{"run_balanced":"false","run_quality":"false","run_cost":"false","run_local":"true"}' ;;
+            *) echo '{"run_balanced":"true","run_quality":"false","run_cost":"false","run_local":"false"}' ;;
+          esac
+        parse_json: true
+        output: gates
+
+      - id: implement-balanced
+        condition: "{{gates.run_balanced}} == 'true'"
         agent: foundation:modular-builder
+        provider_preferences:
+          - provider: anthropic
+            model: claude-sonnet-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-5*
+          - provider: openai
+            model: gpt-4o
         prompt: |
           Implement Workgraph task {{resolved.task_id}}.
+
+          Model profile: balanced
+          Runtime discovery: {{discovery}}
 
           Rules:
           - Use Workgraph task context as source of truth.
           - No Beads usage.
           - Make changes needed for this task only.
           - Run relevant tests for touched code.
+          - Preserve existing UI/design-system conventions unless the task explicitly asks for redesign.
+          - Avoid broad visual/style changes on non-UX tasks; keep UX edits tightly scoped to acceptance.
+          - For UX-affecting changes, ground decisions in local evidence and summarize the rationale briefly.
+          - Research first: inspect task, repo, and runtime before asking clarifying questions.
+          - If a provider is specified but model is not, use the discovered default (`detected_embedding_model`) or infer from runtime/repo hints and proceed.
+          - Ask the user only for judgment-level decisions (priority, aesthetics, policy/risk) or missing credentials.
+          - If escalation is required, ask one concise question with a recommended default and short evidence.
           - Return a short implementation summary.
-        output: implementation
+        output: implementation_balanced
+
+      - id: implement-quality
+        condition: "{{gates.run_quality}} == 'true'"
+        agent: foundation:modular-builder
+        provider_preferences:
+          - provider: anthropic
+            model: claude-opus-*
+          - provider: anthropic
+            model: claude-sonnet-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-5*
+        prompt: |
+          Implement Workgraph task {{resolved.task_id}}.
+
+          Model profile: quality
+          Runtime discovery: {{discovery}}
+
+          Rules:
+          - Use Workgraph task context as source of truth.
+          - No Beads usage.
+          - Make changes needed for this task only.
+          - Run relevant tests for touched code.
+          - Prefer robust root-cause fixes over local patching.
+          - Preserve existing UI/design-system conventions unless the task explicitly asks for redesign.
+          - Avoid broad visual/style changes on non-UX tasks; keep UX edits tightly scoped to acceptance.
+          - For UX-affecting changes, ground decisions in local evidence and summarize the rationale briefly.
+          - Research first: inspect task, repo, and runtime before asking clarifying questions.
+          - If a provider is specified but model is not, use the discovered default (`detected_embedding_model`) or infer from runtime/repo hints and proceed.
+          - Ask the user only for judgment-level decisions (priority, aesthetics, policy/risk) or missing credentials.
+          - If escalation is required, ask one concise question with a recommended default and short evidence.
+          - Return a short implementation summary.
+        output: implementation_quality
+
+      - id: implement-cost
+        condition: "{{gates.run_cost}} == 'true'"
+        agent: foundation:modular-builder
+        provider_preferences:
+          - provider: anthropic
+            model: claude-haiku-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-4o-mini
+          - provider: openai
+            model: gpt-4o
+        prompt: |
+          Implement Workgraph task {{resolved.task_id}}.
+
+          Model profile: cost
+          Runtime discovery: {{discovery}}
+
+          Rules:
+          - Use Workgraph task context as source of truth.
+          - No Beads usage.
+          - Make changes needed for this task only.
+          - Run relevant tests for touched code.
+          - Preserve existing UI/design-system conventions unless the task explicitly asks for redesign.
+          - Avoid broad visual/style changes on non-UX tasks; keep UX edits tightly scoped to acceptance.
+          - For UX-affecting changes, ground decisions in local evidence and summarize the rationale briefly.
+          - Research first: inspect task, repo, and runtime before asking clarifying questions.
+          - If a provider is specified but model is not, use the discovered default (`detected_embedding_model`) or infer from runtime/repo hints and proceed.
+          - Ask the user only for judgment-level decisions (priority, aesthetics, policy/risk) or missing credentials.
+          - If escalation is required, ask one concise question with a recommended default and short evidence.
+          - Return a short implementation summary.
+        output: implementation_cost
+
+      - id: implement-local
+        condition: "{{gates.run_local}} == 'true'"
+        agent: foundation:modular-builder
+        provider_preferences:
+          - provider: ollama
+            model: qwen2.5-coder*
+          - provider: ollama
+            model: llama3*
+          - provider: anthropic
+            model: claude-haiku-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+        prompt: |
+          Implement Workgraph task {{resolved.task_id}}.
+
+          Model profile: local
+          Runtime discovery: {{discovery}}
+
+          Rules:
+          - Use Workgraph task context as source of truth.
+          - No Beads usage.
+          - Make changes needed for this task only.
+          - Run relevant tests for touched code.
+          - Preserve existing UI/design-system conventions unless the task explicitly asks for redesign.
+          - Avoid broad visual/style changes on non-UX tasks; keep UX edits tightly scoped to acceptance.
+          - For UX-affecting changes, ground decisions in local evidence and summarize the rationale briefly.
+          - Research first: inspect task, repo, and runtime before asking clarifying questions.
+          - If a provider is specified but model is not, use the discovered default (`detected_embedding_model`) or infer from runtime/repo hints and proceed.
+          - Ask the user only for judgment-level decisions (priority, aesthetics, policy/risk) or missing credentials.
+          - If escalation is required, ask one concise question with a recommended default and short evidence.
+          - Return a short implementation summary.
+        output: implementation_local
 
       - id: postcheck
         bash: |
@@ -90,17 +411,223 @@ stages:
         parse_json: true
         output: postcheck
 
-      - id: finalize
+      - id: log-pass
+        bash: |
+          set -euo pipefail
+          if [ "{{claim.claimed}}" != "true" ]; then
+            echo '{"ran":false}'
+            exit 0
+          fi
+          wg log "{{resolved.task_id}}" "speedrift pass complete: model_profile={{route.model_profile}}, implementation_profile={{route.implementation_profile}}, summary_profile={{route.summary_profile}}, completion_mode={{route.completion_mode}}, precheck={{precheck.ran}}, postcheck={{postcheck.ran}}" || true
+          echo '{"ran":true}'
+        parse_json: true
+        output: pass_log
+
+      - id: complete-task
+        bash: |
+          set -euo pipefail
+          if [ "{{claim.claimed}}" != "true" ]; then
+            echo '{"ran":false,"completed":false,"action":"none","reason":"no_task_claimed"}'
+            exit 0
+          fi
+          if [ "{{route.completion_mode}}" != "auto" ]; then
+            echo '{"ran":false,"completed":false,"action":"none","reason":"completion_mode_suggest"}'
+            exit 0
+          fi
+
+          TASK="{{resolved.task_id}}"
+          DONE_OUT="$(wg done "$TASK" 2>&1 || true)"
+          if echo "$DONE_OUT" | grep -Eq "Marked|Done|done"; then
+            echo '{"ran":true,"completed":true,"action":"done"}'
+            exit 0
+          fi
+          if echo "$DONE_OUT" | grep -Eqi "requires verification|use .*submit"; then
+            SUBMIT_OUT="$(wg submit "$TASK" 2>&1 || true)"
+            if echo "$SUBMIT_OUT" | grep -Eqi "Submitted|submitted"; then
+              echo '{"ran":true,"completed":true,"action":"submit"}'
+              exit 0
+            fi
+            printf '{"ran":true,"completed":false,"action":"submit_failed","error":%s}\n' "$(printf '%s' "$SUBMIT_OUT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()[:1200]))')"
+            exit 0
+          fi
+
+          printf '{"ran":true,"completed":false,"action":"done_failed","error":%s}\n' "$(printf '%s' "$DONE_OUT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()[:1200]))')"
+        parse_json: true
+        output: completion
+
+      - id: summary-gates
+        bash: |
+          set -euo pipefail
+          if [ "{{claim.claimed}}" != "true" ]; then
+            echo '{"run_balanced":"false","run_quality":"false","run_cost":"false","run_local":"false"}'
+            exit 0
+          fi
+          case "{{route.summary_profile}}" in
+            balanced) echo '{"run_balanced":"true","run_quality":"false","run_cost":"false","run_local":"false"}' ;;
+            quality) echo '{"run_balanced":"false","run_quality":"true","run_cost":"false","run_local":"false"}' ;;
+            cost) echo '{"run_balanced":"false","run_quality":"false","run_cost":"true","run_local":"false"}' ;;
+            local) echo '{"run_balanced":"false","run_quality":"false","run_cost":"false","run_local":"true"}' ;;
+            *) echo '{"run_balanced":"false","run_quality":"false","run_cost":"true","run_local":"false"}' ;;
+          esac
+        parse_json: true
+        output: summary_gates
+
+      - id: finalize-idle
+        condition: "{{claim.claimed}} != 'true'"
+        bash: |
+          set -euo pipefail
+          echo '{"status":"idle","summary":"No ready tasks available. Nothing claimed or executed in this pass.","next":"Unblock dependencies or approve pending-review tasks, then rerun this recipe."}'
+        parse_json: true
+        output: summary
+
+      - id: finalize-balanced
+        condition: "{{summary_gates.run_balanced}} == 'true'"
         agent: foundation:zen-architect
+        provider_preferences:
+          - provider: anthropic
+            model: claude-sonnet-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-5*
         mode: ANALYZE
         prompt: |
           Build a concise final note for task {{resolved.task_id}}.
 
-          implementation={{implementation}}
+          model_profile={{route.model_profile}}
+          implementation_profile={{route.implementation_profile}}
+          summary_profile={{route.summary_profile}}
+          implementation_balanced={{implementation_balanced}}
+          implementation_quality={{implementation_quality}}
+          implementation_cost={{implementation_cost}}
+          implementation_local={{implementation_local}}
+          discovery={{discovery}}
           precheck={{precheck}}
           postcheck={{postcheck}}
+          pass_log={{pass_log}}
+          completion={{completion}}
 
           Include a recommended next command:
-          - `wg done {{resolved.task_id}}` if complete
+          - if completion.action is `done` or `submit`, report the resulting state
+          - otherwise recommend `wg done {{resolved.task_id}}` (or `wg submit {{resolved.task_id}}` for verified tasks) if complete
+          - or create follow-up task(s) if not complete
+        output: summary
+
+      - id: finalize-quality
+        condition: "{{summary_gates.run_quality}} == 'true'"
+        agent: foundation:zen-architect
+        provider_preferences:
+          - provider: anthropic
+            model: claude-opus-*
+          - provider: anthropic
+            model: claude-sonnet-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-5*
+        mode: ANALYZE
+        prompt: |
+          Build a concise final note for task {{resolved.task_id}}.
+
+          model_profile={{route.model_profile}}
+          implementation_profile={{route.implementation_profile}}
+          summary_profile={{route.summary_profile}}
+          implementation_balanced={{implementation_balanced}}
+          implementation_quality={{implementation_quality}}
+          implementation_cost={{implementation_cost}}
+          implementation_local={{implementation_local}}
+          discovery={{discovery}}
+          precheck={{precheck}}
+          postcheck={{postcheck}}
+          pass_log={{pass_log}}
+          completion={{completion}}
+
+          Include a recommended next command:
+          - if completion.action is `done` or `submit`, report the resulting state
+          - otherwise recommend `wg done {{resolved.task_id}}` (or `wg submit {{resolved.task_id}}` for verified tasks) if complete
+          - or create follow-up task(s) if not complete
+        output: summary
+
+      - id: finalize-cost
+        condition: "{{summary_gates.run_cost}} == 'true'"
+        agent: foundation:zen-architect
+        provider_preferences:
+          - provider: anthropic
+            model: claude-haiku-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-4o-mini
+        mode: ANALYZE
+        prompt: |
+          Build a concise final note for task {{resolved.task_id}}.
+
+          model_profile={{route.model_profile}}
+          implementation_profile={{route.implementation_profile}}
+          summary_profile={{route.summary_profile}}
+          implementation_balanced={{implementation_balanced}}
+          implementation_quality={{implementation_quality}}
+          implementation_cost={{implementation_cost}}
+          implementation_local={{implementation_local}}
+          discovery={{discovery}}
+          precheck={{precheck}}
+          postcheck={{postcheck}}
+          pass_log={{pass_log}}
+          completion={{completion}}
+
+          Include a recommended next command:
+          - if completion.action is `done` or `submit`, report the resulting state
+          - otherwise recommend `wg done {{resolved.task_id}}` (or `wg submit {{resolved.task_id}}` for verified tasks) if complete
+          - or create follow-up task(s) if not complete
+        output: summary
+
+      - id: finalize-local
+        condition: "{{summary_gates.run_local}} == 'true'"
+        agent: foundation:zen-architect
+        provider_preferences:
+          - provider: ollama
+            model: qwen2.5-coder*
+          - provider: ollama
+            model: llama3*
+          - provider: anthropic
+            model: claude-haiku-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+        mode: ANALYZE
+        prompt: |
+          Build a concise final note for task {{resolved.task_id}}.
+
+          model_profile={{route.model_profile}}
+          implementation_profile={{route.implementation_profile}}
+          summary_profile={{route.summary_profile}}
+          implementation_balanced={{implementation_balanced}}
+          implementation_quality={{implementation_quality}}
+          implementation_cost={{implementation_cost}}
+          implementation_local={{implementation_local}}
+          discovery={{discovery}}
+          precheck={{precheck}}
+          postcheck={{postcheck}}
+          pass_log={{pass_log}}
+          completion={{completion}}
+
+          Include a recommended next command:
+          - if completion.action is `done` or `submit`, report the resulting state
+          - otherwise recommend `wg done {{resolved.task_id}}` (or `wg submit {{resolved.task_id}}` for verified tasks) if complete
           - or create follow-up task(s) if not complete
         output: summary

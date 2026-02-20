@@ -1,14 +1,16 @@
 name: speedrift-redrift
 description: Launch redrift phased execution lane for brownfield v2 rebuild.
-version: "0.1.0"
+version: "0.2.1"
 author: Speedrift
 
-tags: ["speedrift", "redrift", "brownfield", "v2"]
+tags: ["speedrift", "redrift", "brownfield", "v2", "model-routing"]
 
 context:
   root_task_id: ""
   v2_repo: ""
   phase_checks: true
+  model_profile: quality
+  summary_profile: ""
 
 stages:
   - name: execute-redrift
@@ -23,6 +25,38 @@ stages:
           echo '{"ok":true}'
         parse_json: true
         output: validation
+
+      - id: resolve-model-profile
+        bash: |
+          set -euo pipefail
+          ROOT_PROFILE="{{model_profile}}"
+          SUMMARY_PROFILE="{{summary_profile}}"
+
+          normalize_profile() {
+            case "$1" in
+              balanced|quality|cost|local) printf '%s' "$1" ;;
+              *) printf '' ;;
+            esac
+          }
+
+          ROOT_NORM="$(normalize_profile "$ROOT_PROFILE")"
+          if [ -z "$ROOT_NORM" ]; then
+            ROOT_NORM="quality"
+          fi
+
+          SUMMARY_NORM="$(normalize_profile "$SUMMARY_PROFILE")"
+          if [ -z "$SUMMARY_NORM" ]; then
+            case "$ROOT_NORM" in
+              local) SUMMARY_NORM="local" ;;
+              quality) SUMMARY_NORM="balanced" ;;
+              *) SUMMARY_NORM="cost" ;;
+            esac
+          fi
+
+          printf '{"model_profile":"%s","summary_profile":"%s"}\n' \
+            "$ROOT_NORM" "$SUMMARY_NORM"
+        parse_json: true
+        output: route
 
       - id: run-redrift
         bash: |
@@ -45,12 +79,127 @@ stages:
         parse_json: true
         output: execution
 
-      - id: summary
+      - id: summary-gates
+        bash: |
+          set -euo pipefail
+          case "{{route.summary_profile}}" in
+            balanced) echo '{"run_balanced":"true","run_quality":"false","run_cost":"false","run_local":"false"}' ;;
+            quality) echo '{"run_balanced":"false","run_quality":"true","run_cost":"false","run_local":"false"}' ;;
+            cost) echo '{"run_balanced":"false","run_quality":"false","run_cost":"true","run_local":"false"}' ;;
+            local) echo '{"run_balanced":"false","run_quality":"false","run_cost":"false","run_local":"true"}' ;;
+            *) echo '{"run_balanced":"false","run_quality":"false","run_cost":"true","run_local":"false"}' ;;
+          esac
+        parse_json: true
+        output: summary_gates
+
+      - id: summary-balanced
+        condition: "{{summary_gates.run_balanced}} == 'true'"
         agent: foundation:zen-architect
+        provider_preferences:
+          - provider: anthropic
+            model: claude-sonnet-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-5*
         mode: ANALYZE
         prompt: |
           Summarize redrift lane launch for root task {{root_task_id}}.
 
+          model_profile={{route.model_profile}}
+          summary_profile={{route.summary_profile}}
+          validation={{validation}}
+          execution={{execution}}
+
+          Include next operations:
+          - check generated phase tasks
+          - run per-phase verify/check/commit sequence
+        output: summary
+
+      - id: summary-quality
+        condition: "{{summary_gates.run_quality}} == 'true'"
+        agent: foundation:zen-architect
+        provider_preferences:
+          - provider: anthropic
+            model: claude-opus-*
+          - provider: anthropic
+            model: claude-sonnet-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-5*
+        mode: ANALYZE
+        prompt: |
+          Summarize redrift lane launch for root task {{root_task_id}}.
+
+          model_profile={{route.model_profile}}
+          summary_profile={{route.summary_profile}}
+          validation={{validation}}
+          execution={{execution}}
+
+          Include next operations:
+          - check generated phase tasks
+          - run per-phase verify/check/commit sequence
+        output: summary
+
+      - id: summary-cost
+        condition: "{{summary_gates.run_cost}} == 'true'"
+        agent: foundation:zen-architect
+        provider_preferences:
+          - provider: anthropic
+            model: claude-haiku-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+          - provider: openai
+            model: gpt-4o-mini
+        mode: ANALYZE
+        prompt: |
+          Summarize redrift lane launch for root task {{root_task_id}}.
+
+          model_profile={{route.model_profile}}
+          summary_profile={{route.summary_profile}}
+          validation={{validation}}
+          execution={{execution}}
+
+          Include next operations:
+          - check generated phase tasks
+          - run per-phase verify/check/commit sequence
+        output: summary
+
+      - id: summary-local
+        condition: "{{summary_gates.run_local}} == 'true'"
+        agent: foundation:zen-architect
+        provider_preferences:
+          - provider: ollama
+            model: qwen2.5-coder*
+          - provider: ollama
+            model: llama3*
+          - provider: anthropic
+            model: claude-haiku-*
+          - provider: gemini
+            model: gemini-3.1-pro-preview-customtools*
+          - provider: gemini
+            model: gemini-3.1-pro-preview*
+          - provider: gemini
+            model: gemini-3-pro-preview*
+        mode: ANALYZE
+        prompt: |
+          Summarize redrift lane launch for root task {{root_task_id}}.
+
+          model_profile={{route.model_profile}}
+          summary_profile={{route.summary_profile}}
           validation={{validation}}
           execution={{execution}}
 
